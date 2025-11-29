@@ -1,0 +1,12 @@
+{
+  "name": "coin-collector",
+  "version": "1.0.0",
+  "description": "Minimal authoritative coin-collector multiplayer demo (ws + browser)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  }
+}

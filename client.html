@@ -1,0 +1,172 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Coin Collector - Client</title>
+  <style>
+    body { margin:0; background:#4d6063; color:#eee; font-family: sans-serif; }
+    canvas { display:block; margin:10px auto; background:#4cbeb1; border:1px solid #444; }
+    #hud { text-align:center; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="hud">Connecting...</div>
+
+<script>
+/*
+ Client implements:
+ - sends input intents (keys)
+ - receives authoritative snapshots (with ~200ms latency)
+ - interpolates remote players for smooth motion
+ - renders coins and players
+*/
+
+const WS_URL = (location.hostname === '' ? 'ws://localhost:8080' : `ws://${location.hostname}:8080`);
+const socket = new WebSocket(WS_URL);
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+
+let myId = null;
+let mapW = canvas.width, mapH = canvas.height;
+
+let serverSnapshots = []; // history of snapshots {t, players, coins}
+let players = {}; // id -> {id, x, y, score, renderX, renderY}
+let coins = {}; // id -> {id,x,y}
+let inputState = { up:false, down:false, left:false, right:false };
+
+// interpolation delay (should >= simulated network latency)
+const INTERP_DELAY = 200; // ms
+
+socket.addEventListener('open', () => { hud.innerText = 'Connected. Waiting for welcome...'; });
+
+socket.addEventListener('message', (ev) => {
+  // messages are delayed by server (it simulates latency)
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'welcome') {
+    myId = msg.id;
+    if (msg.map) { mapW = msg.map.w; mapH = msg.map.h; canvas.width = mapW; canvas.height = mapH; }
+    hud.innerText = `You are player ${myId}. Use arrow keys / WASD to move. Open another tab to join.`;
+  } else if (msg.type === 'snapshot') {
+    // push snapshot with server timestamp
+    serverSnapshots.push(msg);
+    // cap
+    if (serverSnapshots.length > 60) serverSnapshots.shift();
+    // update known coin list quickly (authoritative)
+    msg.coins.forEach(c => coins[c.id] = c);
+    // remove coins not in snapshot
+    const ids = new Set(msg.coins.map(c => c.id));
+    Object.keys(coins).forEach(k => { if (!ids.has(Number(k))) delete coins[k]; });
+  }
+});
+
+// send input at fixed rate
+setInterval(() => {
+  if (socket.readyState === WebSocket.OPEN && myId !== null) {
+    const payload = { type: 'input', up: inputState.up, down: inputState.down, left: inputState.left, right: inputState.right, stamp: Date.now() };
+    socket.send(JSON.stringify(payload));
+  }
+}, 50);
+
+// keyboard
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowUp' || e.key === 'w') inputState.up = true;
+  if (e.key === 'ArrowDown' || e.key === 's') inputState.down = true;
+  if (e.key === 'ArrowLeft' || e.key === 'a') inputState.left = true;
+  if (e.key === 'ArrowRight' || e.key === 'd') inputState.right = true;
+});
+window.addEventListener('keyup', e => {
+  if (e.key === 'ArrowUp' || e.key === 'w') inputState.up = false;
+  if (e.key === 'ArrowDown' || e.key === 's') inputState.down = false;
+  if (e.key === 'ArrowLeft' || e.key === 'a') inputState.left = false;
+  if (e.key === 'ArrowRight' || e.key === 'd') inputState.right = false;
+});
+
+// interpolation helper
+function interp(a, b, t) { return a + (b - a) * t; }
+
+function renderLoop() {
+  const now = Date.now();
+  // target time for interpolation
+  const renderTime = now - INTERP_DELAY;
+
+  // find two snapshots surrounding renderTime
+  let older = null, newer = null;
+  for (let i = serverSnapshots.length - 1; i >= 0; i--) {
+    const s = serverSnapshots[i];
+    if (s.t <= renderTime) { older = s; newer = serverSnapshots[i+1] || s; break; }
+  }
+  if (!older) { older = serverSnapshots[0] || null; newer = serverSnapshots[1] || older; }
+
+  if (older && newer) {
+    const span = Math.max(1, newer.t - older.t);
+    const alpha = (renderTime - older.t) / span;
+    // update players from interpolated snapshot
+    const byId = {};
+    older.players.forEach(p => byId[p.id] = { older: p });
+    newer.players.forEach(p => { byId[p.id] = Object.assign(byId[p.id]||{}, { newer: p }); });
+
+    Object.keys(byId).forEach(id => {
+      const entry = byId[id];
+      const o = entry.older || entry.newer;
+      const n = entry.newer || entry.older;
+      if (!players[id]) players[id] = { id: Number(id), x: o.x, y: o.y, score: o.score, renderX: o.x, renderY: o.y };
+      const rx = interp(o.x, n.x, alpha);
+      const ry = interp(o.y, n.y, alpha);
+      players[id].renderX = rx;
+      players[id].renderY = ry;
+      players[id].x = n.x; // keep authoritative up-to-date
+      players[id].y = n.y;
+      players[id].score = n.score;
+    });
+  }
+
+  // sync coins from latest snapshot (authoritative)
+  const latest = serverSnapshots[serverSnapshots.length - 1];
+  if (latest) {
+    coins = {};
+    latest.coins.forEach(c => coins[c.id] = c);
+  }
+
+
+    // --- SCOREBOARD HUD UPDATE ---
+  let scoreText = "Scores: ";
+  for (const p of Object.values(players)) {
+    scoreText += `P${p.id}=${p.score}  `;
+  }
+  hud.innerText = scoreText;
+
+
+  // draw
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // coins
+  Object.values(coins).forEach(c => {
+    ctx.beginPath();
+    ctx.fillStyle = '#ffd700';
+    ctx.arc(c.x, c.y, 10, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // players
+  Object.values(players).forEach(p => {
+    const x = (p.id === myId) ? p.x : p.renderX;
+    const y = (p.id === myId) ? p.y : p.renderY;
+    // Rect
+    ctx.fillStyle = (p.id === myId) ? '#00008B' : '#8B0000'; // dark blue for self, dark red for others
+    ctx.fillRect(x - 16, y - 16, 32, 32); // square centered at (x, y)
+
+    // id
+    ctx.fillStyle = '#000';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(`P${p.id} (${p.score})`, x-18, y-22);
+  });
+
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
+</script>
+</body>
+</html>
